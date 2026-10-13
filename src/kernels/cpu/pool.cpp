@@ -8,13 +8,14 @@
 #include <atomic>
 #include <cmath>
 #include <chrono>
-#include <immintrin.h>
+#include "strata/platform/cpu_relax.hpp"
 #if defined(_MSC_VER)
 #include <intrin.h>   // __cpuidex, __rdtsc (STRATA_POOL_UMWAIT)
 #endif
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 #if defined(_WIN32)
@@ -303,6 +304,32 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
         }
         all_cpus.push_back(cl);
     }
+    // Tegra kernels (Jetson Thor) export core_id = 0 for EVERY CPU: the single (pkg, core) key would
+    // collapse the whole chip into one core's SMT siblings, worker_cores would empty out and the pool
+    // would run the CPU experts on a single worker + the host.  thread_siblings_list is honest there
+    // (every CPU alone).  When it says no CPU has a sibling yet many CPUs share one physical key, the
+    // core_id is bogus - count every CPU as its own core.  A real single-core SMT CPU keeps collapsing:
+    // its siblings list names both threads ("-"/",") and this guard stays out.
+    if (seen_phys.size() == 1 && all_cpus.size() > 1) {
+        bool no_smt = true;
+        for (const auto& cl : all_cpus) {
+            char path[96];
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cl.cpu);
+            if (std::FILE* f = std::fopen(path, "r")) {
+                char text[256] = {0};
+                const size_t n = std::fread(text, 1, sizeof text - 1, f);
+                std::fclose(f);
+                if (n > 0 && (std::strchr(text, '-') != nullptr || std::strchr(text, ',') != nullptr)) {
+                    no_smt = false;
+                    break;
+                }
+            }
+        }
+        if (no_smt) {
+            for (auto& cl : all_cpus) cl.is_sibling = false;
+            seen_phys.assign(all_cpus.size(), {0, 0});
+        }
+    }
 
     // #798: which CPUs are E-cores.  Intel's hybrid PMU lists them (cpu_atom/cpus beside cpu_core/cpus); without it a
     // CPU is an E-core when its capacity is under 90% of the largest.  Turbo Boost Max 3.0 gives the "favored"
@@ -565,7 +592,7 @@ void ExpertPool::worker(int id) {
             } else
 #endif
             {
-                _mm_pause();
+                strata::platform::cpu_relax();
                 if ((++spins & 1023u) != 0) continue;
             }
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
@@ -624,7 +651,7 @@ void ExpertPool::wait_parked(const char* what) {
     uint32_t spins = 0;
     std::chrono::steady_clock::time_point t0{};
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) {
-        _mm_pause();
+        strata::platform::cpu_relax();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u) t0 = now;
@@ -647,7 +674,7 @@ void ExpertPool::wait_done(int n) {
     for (;;) {
         const uint32_t d = done_.load(std::memory_order_acquire);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
-        _mm_pause();
+        strata::platform::cpu_relax();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
