@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 #if defined(_WIN32)
@@ -263,6 +264,32 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
             }
         }
         all_cpus.push_back(cl);
+    }
+    // Tegra kernels (Jetson Thor) export core_id = 0 for EVERY CPU: the single (pkg, core) key would
+    // collapse the whole chip into one core's SMT siblings, worker_cores would empty out and the pool
+    // would run the CPU experts on a single worker + the host.  thread_siblings_list is honest there
+    // (every CPU alone).  When it says no CPU has a sibling yet many CPUs share one physical key, the
+    // core_id is bogus - count every CPU as its own core.  A real single-core SMT CPU keeps collapsing:
+    // its siblings list names both threads ("-"/",") and this guard stays out.
+    if (seen_phys.size() == 1 && all_cpus.size() > 1) {
+        bool no_smt = true;
+        for (const auto& cl : all_cpus) {
+            char path[96];
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cl.cpu);
+            if (std::FILE* f = std::fopen(path, "r")) {
+                char text[256] = {0};
+                const size_t n = std::fread(text, 1, sizeof text - 1, f);
+                std::fclose(f);
+                if (n > 0 && (std::strchr(text, '-') != nullptr || std::strchr(text, ',') != nullptr)) {
+                    no_smt = false;
+                    break;
+                }
+            }
+        }
+        if (no_smt) {
+            for (auto& cl : all_cpus) cl.is_sibling = false;
+            seen_phys.assign(all_cpus.size(), {0, 0});
+        }
     }
 
     // #798: which CPUs are E-cores.  Intel's hybrid PMU lists them (cpu_atom/cpus beside cpu_core/cpus); without it a
