@@ -775,7 +775,8 @@ def cuda_driver_gpus():
                 physical = min(ram_gb(), total.value / 2**30)
                 g.update({"uma": True, "dedicated_gb": 0.0, "shared_gb": physical,
                           "vram_gb": max(0.0, physical - UMA_OS_LEFT_GB),
-                          "jetson": arm64_host() and major == 8 and minor == 7})
+                          "jetson": arm64_host() and (major == 8 and minor == 7 or major == 11),
+                          "thor": arm64_host() and major == 11})
             found.append(g)
         return found
     except (OSError, AttributeError):
@@ -3093,10 +3094,16 @@ def install_build_tools(gpu, yes):
     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
     archs = [int(x) for x in gpu.get("archs", [gpu["arch"]])]
     if gpu.get("jetson"):
-        nvcc, cuda_v = find_nvcc(below=(13, 0))
-        if nvcc is None or cuda_v < (12, 6):
-            fail("Jetson Orin needs the JetPack CUDA 12.6 toolkit",
-                 "install JetPack's development packages (nvidia-jetpack-dev), then run setup again")
+        if gpu.get("thor"):
+            nvcc, cuda_v = find_nvcc()
+            if nvcc is None or cuda_v < (13, 0):
+                fail("Jetson Thor (sm_110) needs the CUDA 13 toolkit",
+                     "install the CUDA 13 development packages (nvidia-jetpack-dev), then run setup again")
+        else:
+            nvcc, cuda_v = find_nvcc(below=(13, 0))
+            if nvcc is None or cuda_v < (12, 6):
+                fail("Jetson Orin needs the JetPack CUDA 12.6 toolkit",
+                     "install JetPack's development packages (nvidia-jetpack-dev), then run setup again")
         if shutil.which("g++") is None:
             fail("g++ is missing", "install build-essential, then run setup again")
         return nvcc, None
@@ -3273,7 +3280,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     toolkit 12 (default: 12 for a card older than CUDA 13 supports): the experimental CUDA 12 engine, in
     engine-cuda12/ with its own build folders."""
     if toolkit is None:
-        toolkit = 12 if gpu.get("jetson") or min(int(x) for x in gpu.get("archs", [gpu["arch"]])) < CUDA13_MIN_ARCH else 13
+        toolkit = 13 if gpu.get("thor") else (12 if gpu.get("jetson") or min(int(x) for x in gpu.get("archs", [gpu["arch"]])) < CUDA13_MIN_ARCH else 13)
     t12 = int(toolkit) == 12
     eng = engine_dir(toolkit)
     eng.mkdir(exist_ok=True)
@@ -4962,7 +4969,13 @@ def main() -> int:
         memory_text = (f"{gpu['shared_gb']:.1f} GiB shared physical RAM ({gpu['vram_gb']:.1f} GiB after OS headroom)"
                        if gpu.get("uma") else f"{gpu['vram_gb']:.1f} GB VRAM")
         ok(f"GPU: {gpu['name']}, {memory_text}, compute capability {cc(gpu)}, driver {gpu['driver']}")
-        if gpu.get("jetson"):
+        if gpu.get("thor"):
+            if str(a.cuda) == "12":
+                fail("Jetson Thor (Blackwell, sm_110) needs the CUDA 13 toolkit", "use --cuda 13")
+            cuda_tk, why = 13, "Jetson Thor (Blackwell, sm_110) uses the CUDA 13 toolkit"
+            if gpu.get("driver_api", 0) < 13000:
+                fail("Jetson Thor's CUDA driver API is older than 13.0", "update the L4T/JetPack compute stack")
+        elif gpu.get("jetson"):
             if str(a.cuda) == "13":
                 fail("Jetson Orin support uses JetPack's CUDA 12.6 toolkit", "use --cuda 12")
             cuda_tk, why = 12, "Jetson Orin uses the installed JetPack CUDA 12.6 toolkit"
